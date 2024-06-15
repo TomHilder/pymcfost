@@ -68,7 +68,7 @@ class Params:
     _minimum_version = 3.0
 
     def __init__(self, filename=None, **kwargs):
-        
+
         # Instantiate empty classes and lists to store properties
         self.simu = Simu()
         self.phot = Photons()
@@ -79,7 +79,7 @@ class Params:
         self.mol = Mol()
         self.atomic = Atomic()
         self.stars = []
-        
+
         self.filename = filename
         self._read(**kwargs)
 
@@ -166,8 +166,11 @@ class Params:
         self.map.PA = float(line[0])
 
         # -- Scattering method --
-        line = next(f).split()
-        self.simu.scattering_method = int(line[0])
+        if (self.simu.version < 4.1):
+            line = next(f).split()
+            self.simu.scattering_method = int(line[0])
+        else:
+            self.simu.scattering_method = 0
 
         line = next(f).split()
         self.simu.phase_function_method = int(line[0])
@@ -271,10 +274,17 @@ class Params:
         self.mol.compute_pop = _word_to_bool(line[0])
         self.mol.compute_pop_accurate = _word_to_bool(line[1])
         self.mol.LTE = _word_to_bool(line[2])
-        self.mol.profile_width = float(line[3])
+        if (self.simu.version < 4.1):
+            self.mol.profile_width = float(line[3])
+        else:
+            self.mol.profile_width = 15.0
 
         line = next(f).split()
         self.mol.v_turb = float(line[0])
+        if (self.simu.version > 4.0):
+            self.mol.v_turb_unit = line[1]
+        else:
+            self.mol.v_turb_unit = "km/s"
 
         line = next(f).split()
         n_mol = int(line[0])
@@ -287,9 +297,11 @@ class Params:
             self.mol.molecule[k].file = line[0]
             self.mol.molecule[k].level_max = int(line[1])
 
-            line = next(f).split()
-            self.mol.molecule[k].v_max = float(line[0])
-            self.mol.molecule[k].nv = int(line[1])
+            if (self.simu.version < 4.1):
+                line = next(f).split()
+                self.mol.molecule[k].v_max = float(line[0])
+                self.mol.molecule[k].v_min = - self.mol.molecule[k].v_max
+                self.mol.molecule[k].nv = 2*int(line[1])+1
 
             line = next(f).split()
             self.mol.molecule[k].cst_abundance = _word_to_bool(line[0])
@@ -305,6 +317,13 @@ class Params:
             self.mol.molecule[k].transitions = list(
                 map(int, line[0:nTrans])
             )  # convert list of str to int
+
+            if (self.simu.version > 4.0):
+                line = next(f).split()
+                self.mol.molecule[k].v_min = float(line[0])
+                self.mol.molecule[k].v_max = float(line[1])
+                self.mol.molecule[k].nv = int(line[2])
+
 
         if (self.simu.version > 3.0):
             # -- Atom settings --
@@ -384,7 +403,7 @@ class Params:
         """
 
         # -- Photon packets --
-        txt = f"""4.0                       mcfost version\n
+        txt = f"""4.1                       mcfost version\n
 #-- Number of photon packages --
   {self.phot.nphot_T:<10.5g}              nbr_photons_eq_th  : T computation
   {self.phot.nphot_SED:<10.5g}              nbr_photons_lambda : SED computation
@@ -412,7 +431,6 @@ class Params:
 
         # -- Scattering method --
         txt += f"""#-- Scattering method --
-  {self.simu.scattering_method}                       0=auto, 1=grain prop, 2=cell prop
   {self.simu.phase_function_method}                       1=Mie, 2=hg (2 implies the loss of polarizarion)\n\n"""
 
         # -- Symetries --
@@ -460,16 +478,17 @@ class Params:
         # -- Molecular settings --
         txt += f"""#-- Molecular RT settings --
   {self.mol.compute_pop}  {self.mol.compute_pop_accurate}  {self.mol.LTE} {self.mol.profile_width}      lpop, laccurate_pop, LTE, profile width
-  {self.mol.v_turb}                        v_turb [km/s]
+  {self.mol.v_turb} {self.mol.v_turb_unit}                       v_turb, unit
   {self.mol.n_mol}                          nmol\n"""
         for k in range(self.mol.n_mol):
             txt += f"""  {self.mol.molecule[k].file} {self.mol.molecule[k].level_max}          molecular data filename, level_max
-  {self.mol.molecule[k].v_max} {self.mol.molecule[k].nv}                 vmax (km.s-1), n_speed
   {self.mol.molecule[k].cst_abundance} {self.mol.molecule[k].abundance} {self.mol.molecule[k].abundance_file}   cst molecule abundance ?, abundance, abundance file
   {self.mol.molecule[k].ray_tracing}  {self.mol.molecule[k].n_trans}                   ray tracing ?,  number of lines in ray-tracing\n """
             for j in range(self.mol.molecule[k].n_trans):
                 txt += f" {self.mol.molecule[k].transitions[j]}"
             txt += f" transition numbers\n"
+        txt += f"{self.mol.molecule[k].v_min} {self.mol.molecule[k].v_max} {self.mol.molecule[k].nv}                 vmin, vmax (km.s-1), n_speed\n"
+
         txt += f"\n"
 
          # -- Atomic settings --
@@ -489,7 +508,7 @@ class Params:
         txt += f"""#-- Star properties --
   {self.simu.n_stars}  Number of stars\n"""
         for k in range(self.simu.n_stars):
-            txt += f"""  {self.stars[k].Teff} {self.stars[k].R} {self.stars[k].M} {self.stars[k].x} {self.stars[k].y} {self.stars[k].x} {self.stars[k].is_bb}  Temp, radius (solar radius),M (solar mass),x,y,z (AU), is a blackbody?
+            txt += f"""  {self.stars[k].Teff} {self.stars[k].R} {self.stars[k].M} {self.stars[k].x} {self.stars[k].y} {self.stars[k].z} {self.stars[k].is_bb}  Temp, radius (solar radius),M (solar mass),x,y,z (AU), is a blackbody?
   {self.stars[k].file}
   {self.stars[k].fUV} {self.stars[k].slope_UV}     fUV, slope_UV\n"""
 
@@ -503,7 +522,7 @@ class Params:
     def calc_inclinations(self):
         # Calculate the inclinations for the ray-traced SEDs and images
         if self.map.RT_ntheta == 1:
-            return self.map.RT_imin
+            return [self.map.RT_imin]
         else:
             cos_min, cos_max = np.cos(np.deg2rad([self.map.RT_imin, self.map.RT_imax]))
             if self.map.lRT_centered:

@@ -28,6 +28,9 @@ def pseudo_CASA_simdata(
     Delta_v=None,
     rms=0,
     binned_dv=None,
+    pola_needed=False,
+    rms_q=0.0,
+    rms_u=0.0,
 ):
     """
     Generate a fits file as if it was a CASA simdata output
@@ -36,7 +39,7 @@ def pseudo_CASA_simdata(
      - bin channels to spacing binned_dv given in km/s
      - todo : resample in velocity as required
 
-    Basically generate a CASA fits file with perfect uv coverage and no noise
+    Basically generate a CASA fits file with perfect uv coverage
     """
 
     workdir = "CASA/"
@@ -72,9 +75,17 @@ def pseudo_CASA_simdata(
         if model.is_casa:
             image = model.image[:, :]
         else:
-            # Convert to Jy
-            image = Wm2_to_Jy(model.image[0, iaz, i, :, :], sc.c / model.wl)
+            if pola_needed == False:
+                # Convert to Jy
+                image = Wm2_to_Jy(model.image[0, iaz, i, :, :], model.freq)
+            else:
+                # Convert to Jy
+                image_I = Wm2_to_Jy(model.image[0, iaz, i, :, :], model.freq)
+                image_Q = Wm2_to_Jy(model.image[1, iaz, i, :, :], model.freq)
+                image_U = Wm2_to_Jy(model.image[2, iaz, i, :, :], model.freq)
     else:  # cube
+        if pola_needed == True:
+            raise Exception("ERROR: can only create Q, U fits for images, not cubes")
         if model.is_casa:
             # -- continuum subtraction
             if subtract_cont:
@@ -92,7 +103,15 @@ def pseudo_CASA_simdata(
                 image = model.lines[iaz, i, iTrans, :, :, :]
 
             # Convert to Jy
-            image = Wm2_to_Jy(image, model.freq[iTrans])
+            # image = Wm2_to_Jy(image, model.freq[iTrans])
+            image = Wm2_to_Jy(image, model.freq)
+
+    if pola_needed == False:
+        imagelist = [image]
+        extension = [""]
+    else:
+        imagelist = [image_I, image_Q, image_U]
+        extension = ["", "_Q", "_U"]
 
     # -- writing fits file
     hdr = fits.Header()
@@ -129,14 +148,18 @@ def pseudo_CASA_simdata(
         hdr["CDELT3"] = model.dv * 1000
         hdr["CUNIT3"] = "m/s"
 
-    hdr["RESTFREQ"] = model.freq[iTrans]  # Hz
+    # hdr["RESTFREQ"] = model.freq[iTrans]  # Hz
+    if is_image:
+        hdr["RESTFREQ"] = model.freq
+    else:
+        hdr["RESTFREQ"] = model.freq[iTrans]  # Hz
     hdr["BUNIT"] = "JY/BEAM"
     hdr["BTYPE"] = "Intensity"
     hdr["BMAJ"] = bmaj / 3600.0
     hdr["BMIN"] = bmin / 3600.0
     hdr["BPA"] = bpa
 
-    # Convolve spectrally
+    # Convolve spend
     if Delta_v is not None:
         image = model._spectral_convolve(image, Delta_v)
 
@@ -146,83 +169,82 @@ def pseudo_CASA_simdata(
     sigma_y = bmaj / model.pixelscale * FWHM_to_sigma  # in pixels
     beam = Gaussian2DKernel(sigma_x, sigma_y, bpa * np.pi / 180)
 
-    if image.ndim == 2:
-        image = convolve_fft(image, beam)
-    else:
-        for iv in range(image.shape[0]):
-            image[iv, :, :] = convolve_fft(image[iv, :, :], beam)
-
     # -- Jy/pixel to Jy/beam
     beam_area = bmin * bmaj * np.pi / (4.0 * np.log(2.0))
     pix_area = model.pixelscale**2
-    image *= beam_area / pix_area
 
-    print(f"Peak flux is {np.max(image)} Jy/beam")
+    for k, img in enumerate(imagelist):
+        if img.ndim == 2:
+            img = convolve_fft(img, beam)
+        elif img.ndim == 3:
+            for iv in range(img.shape[0]):
+                img[iv, :, :] = convolve_fft(img[iv, :, :], beam)
 
-    # -- This is for testing purpose only so far: this needs to be updated and to come before
-    # --  - compute the scale factor in 1 channel once,
-    # --  - then add noise before spatial and spectral convolution so we do not convolve twice
-    if rms > 0.0:
-        noise = np.random.randn(image.size).reshape(image.shape)
-        for iv in range(image.shape[0]):
-            noise[iv, :, :] = convolve_fft(noise[iv, :, :], beam)
-        if Delta_v is not None:
-            noise = model._spectral_convolve(noise, Delta_v)
-        # print(np.std(noise), beam_area/pix_area)
-        noise *= rms / np.std(noise)
-        image += noise
+        img *= beam_area / pix_area
+        print(f"Peak flux is {np.max(img)} Jy/beam")
 
-    # bin channels as requested
-    if binned_dv is not None:
+        # -- This is for testing purpose only so far: this needs to be updated and to come before
+        # --  - compute the scale factor in 1 channel once,
+        # --  - then add noise before spatial and spectral convolution so we do not convolve twice
+        if rms > 0.0:
+            noise = np.random.randn(img.size).reshape(img.shape)
+            if img.ndim == 2:
+                noise = convolve_fft(noise, beam)
+            elif img.ndim != 2:
+                for iv in range(img.shape[0]):
+                    noise[iv, :, :] = convolve_fft(noise[iv, :, :], beam)
+            if Delta_v is not None:
+                noise = model._spectral_convolve(noise, Delta_v)
+            # print(np.std(noise), beam_area/pix_area)
+            noise *= rms / np.std(noise)
+            img += noise
 
-        print(f"Binning in velocity to spacing of {binned_dv:.2f} km/s")
+        # bin channels as requested
+        if binned_dv is not None:
 
-        # get bin edges without assuming that its a multiple of the current spacing
-        bin_edge_zero = binned_dv / 2
-        bin_edge_max = model.velocity.max() + binned_dv / 2
-        positive_bin_edges = np.arange(
-            bin_edge_zero, bin_edge_max + binned_dv, binned_dv
-        )
-        negative_bin_edges = -positive_bin_edges[::-1]
-        all_bin_edges = np.concatenate((negative_bin_edges, positive_bin_edges))
+            print(f"Binning in velocity to spacing of {binned_dv:.2f} km/s")
 
-        # do binning
-        binned_image = np.zeros(
-            (len(all_bin_edges) - 1, image.shape[1], image.shape[2])
-        )
-        for i in tqdm(range(image.shape[1])):
-            for j in range(image.shape[2]):
-                # get line
-                line = image[:, i, j]
-                # get binned line
-                binned_line, _, _ = binned_statistic(
-                    x=model.velocity, values=line, bins=all_bin_edges
-                )
-                # store
-                binned_image[:, i, j] = binned_line
+            # get bin edges without assuming that its a multiple of the current spacing
+            bin_edge_zero = binned_dv / 2
+            bin_edge_max = model.velocity.max() + binned_dv / 2
+            positive_bin_edges = np.arange(
+                bin_edge_zero, bin_edge_max + binned_dv, binned_dv
+            )
+            negative_bin_edges = -positive_bin_edges[::-1]
+            all_bin_edges = np.concatenate((negative_bin_edges, positive_bin_edges))
 
-        # overwrite image with binned image
-        image = binned_image
+            # do binning
+            binned_image = np.zeros(
+                (len(all_bin_edges) - 1, img.shape[1], img.shape[2])
+            )
+            for i in tqdm(range(img.shape[1])):
+                for j in range(img.shape[2]):
+                    # get line
+                    line = img[:, i, j]
+                    # get binned line
+                    binned_line, _, _ = binned_statistic(
+                        x=model.velocity, values=line, bins=all_bin_edges
+                    )
+                    # store
+                    binned_image[:, i, j] = binned_line
 
-        # update header
-        hdr["CTYPE3"] = "VELO-LSR"
-        hdr["CRVAL3"] = 0.0  # line center
-        hdr["CRPIX3"] = image.shape[0] // 2 + 1
-        hdr["CDELT3"] = binned_dv * 1e3
-        hdr["CUNIT3"] = "m/s"
+            # overwrite image with binned image
+            img = binned_image
 
-    hdu = fits.PrimaryHDU(image, header=hdr)
-    hdul = fits.HDUList(hdu)
+            # update header
+            hdr["CTYPE3"] = "VELO-LSR"
+            hdr["CRVAL3"] = 0.0  # line center
+            # hdr["CRVAL3"] = float(k+1)        # this was in Christophe's changes
+                                                # and I don't understand it but it
+                                                # is probably the correct thing to
+                                                # do so consider putting it back in
+            hdr["CRPIX3"] = img.shape[0] // 2 + 1
+            hdr["CDELT3"] = binned_dv * 1e3
+            hdr["CUNIT3"] = "m/s"
 
-    hdul.writeto(workdir + simu_name + ".fits", overwrite=True)
-
-
-# 	if rms > 0.0:
-# 		noise = np.random.randn(cube.size).reshape(cube.shape)
-# 		noise = np.array([convolve(c, beam) for c in noise])
-# 		noise = np.convolve(noise, spectral_response, axis=0)
-# 		noise *= rms / np.std(noise)
-# 		image += noise
+        hdu = fits.PrimaryHDU(img, header=hdr)
+        hdul = fits.HDUList(hdu)
+        hdul.writeto(workdir + simu_name + extension[k] + ".fits", overwrite=True)
 
 
 def CASA_simdata(
