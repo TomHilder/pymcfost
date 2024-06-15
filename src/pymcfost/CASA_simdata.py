@@ -1,19 +1,39 @@
-import numpy as np
 import os
 import subprocess
-import scipy.constants as sc
-from scipy import interpolate
-from .image import Image
-from .utils import Wm2_to_Jy, FWHM_to_sigma
-from astropy.io import fits
-from astropy.convolution import Gaussian2DKernel, convolve_fft, convolve
-from scipy.ndimage import convolve1d
 
-def pseudo_CASA_simdata(model,i=0,iaz=0,iTrans=None,simu_name = "pseudo_casa",beam=None,bmaj=None,bmin=None,bpa=None,subtract_cont=False,Delta_v=None, rms=0):
+import numpy as np
+import scipy.constants as sc
+from astropy.convolution import Gaussian2DKernel, convolve, convolve_fft
+from astropy.io import fits
+from scipy import interpolate
+from scipy.ndimage import convolve1d
+from scipy.stats import binned_statistic
+from tqdm import tqdm
+
+from .image import Image
+from .utils import FWHM_to_sigma, Wm2_to_Jy
+
+
+def pseudo_CASA_simdata(
+    model,
+    i=0,
+    iaz=0,
+    iTrans=None,
+    simu_name="pseudo_casa",
+    beam=None,
+    bmaj=None,
+    bmin=None,
+    bpa=None,
+    subtract_cont=False,
+    Delta_v=None,
+    rms=0,
+    binned_dv=None,
+):
     """
     Generate a fits file as if it was a CASA simdata output
      - convolve spatially with beam (bmin, bmaj in arsec, bpa in degrees)
      - convolve spectrally with Delta_v in km/s
+     - bin channels to spacing binned_dv given in km/s
      - todo : resample in velocity as required
 
     Basically generate a CASA fits file with perfect uv coverage and no noise
@@ -29,11 +49,15 @@ def pseudo_CASA_simdata(model,i=0,iaz=0,iTrans=None,simu_name = "pseudo_casa",be
     # --- Checking arguments
     if not is_image:
         if iTrans is None:
-            raise Exception("Missing transition number iTrans : iTrans is a python index from 0 to nTrans-1")
+            raise Exception(
+                "Missing transition number iTrans : iTrans is a python index from 0 to nTrans-1"
+            )
 
         nTrans = model.freq.size
         if iTrans > nTrans - 1:
-            raise Exception(f"ERROR: iTrans is not in the computed range : nTrans={nTrans}")
+            raise Exception(
+                f"ERROR: iTrans is not in the computed range : nTrans={nTrans}"
+            )
 
     if beam is not None:
         bmaj = beam
@@ -54,20 +78,23 @@ def pseudo_CASA_simdata(model,i=0,iaz=0,iTrans=None,simu_name = "pseudo_casa",be
         if model.is_casa:
             # -- continuum subtraction
             if subtract_cont:
-                image = model.lines[:,:,:] - model.lines[0,:,:]
+                image = model.lines[:, :, :] - model.lines[0, :, :]
             else:
                 image = model.lines[:, :, :]
         else:
             # -- continuum subtraction
             if subtract_cont:
-                image = model.lines[iaz, i, iTrans,:,:,:] - model.cont[iaz, i, iTrans, np.newaxis, :, :]
+                image = (
+                    model.lines[iaz, i, iTrans, :, :, :]
+                    - model.cont[iaz, i, iTrans, np.newaxis, :, :]
+                )
             else:
-                image = model.lines[iaz, i, iTrans,:,:,:]
+                image = model.lines[iaz, i, iTrans, :, :, :]
 
             # Convert to Jy
             image = Wm2_to_Jy(image, model.freq[iTrans])
 
-    #-- writing fits file
+    # -- writing fits file
     hdr = fits.Header()
     hdr["EXTEND"] = True
     hdr["OBJECT"] = "mcfost"
@@ -92,21 +119,21 @@ def pseudo_CASA_simdata(model,i=0,iaz=0,iTrans=None,simu_name = "pseudo_casa",be
 
         # 4th axis
         hdr["CTYPE4"] = "FREQ"
-        hdr["CRVAL4"] = model.freq # Hz
+        hdr["CRVAL4"] = model.freq  # Hz
         hdr["CDELT4"] = 2e9  # 2GHz by default
         hdr["CRPIX4"] = 0
     else:
         hdr["CTYPE3"] = "VELO-LSR"
         hdr["CRVAL3"] = 0.0  # line center
-        hdr["CRPIX3"] = model.nv//2 + 1
+        hdr["CRPIX3"] = model.nv // 2 + 1
         hdr["CDELT3"] = model.dv * 1000
         hdr["CUNIT3"] = "m/s"
 
     hdr["RESTFREQ"] = model.freq[iTrans]  # Hz
     hdr["BUNIT"] = "JY/BEAM"
     hdr["BTYPE"] = "Intensity"
-    hdr["BMAJ"] = bmaj/3600.
-    hdr["BMIN"] = bmin/3600.
+    hdr["BMAJ"] = bmaj / 3600.0
+    hdr["BMIN"] = bmin / 3600.0
     hdr["BPA"] = bpa
 
     # Convolve spectrally
@@ -114,7 +141,7 @@ def pseudo_CASA_simdata(model,i=0,iaz=0,iTrans=None,simu_name = "pseudo_casa",be
         image = model._spectral_convolve(image, Delta_v)
 
     print(f"Spatial convolution at {bmaj} x {bmin}")
-    #-- Convolution by beam
+    # -- Convolution by beam
     sigma_x = bmin / model.pixelscale * FWHM_to_sigma  # in pixels
     sigma_y = bmaj / model.pixelscale * FWHM_to_sigma  # in pixels
     beam = Gaussian2DKernel(sigma_x, sigma_y, bpa * np.pi / 180)
@@ -123,39 +150,80 @@ def pseudo_CASA_simdata(model,i=0,iaz=0,iTrans=None,simu_name = "pseudo_casa",be
         image = convolve_fft(image, beam)
     else:
         for iv in range(image.shape[0]):
-            image[iv,:,:] = convolve_fft(image[iv,:,:], beam)
+            image[iv, :, :] = convolve_fft(image[iv, :, :], beam)
 
-    #-- Jy/pixel to Jy/beam
+    # -- Jy/pixel to Jy/beam
     beam_area = bmin * bmaj * np.pi / (4.0 * np.log(2.0))
     pix_area = model.pixelscale**2
-    image *= beam_area/pix_area
+    image *= beam_area / pix_area
 
     print(f"Peak flux is {np.max(image)} Jy/beam")
 
-	#-- This is for testing purpose only so far: this needs to be updated and to come before
-	#--  - compute the scale factor in 1 channel once,
-	#--  - then add noise before spatial and spectral convolution so we do not convolve twice
+    # -- This is for testing purpose only so far: this needs to be updated and to come before
+    # --  - compute the scale factor in 1 channel once,
+    # --  - then add noise before spatial and spectral convolution so we do not convolve twice
     if rms > 0.0:
         noise = np.random.randn(image.size).reshape(image.shape)
         for iv in range(image.shape[0]):
-            noise[iv,:,:] = convolve_fft(noise[iv,:,:], beam)
+            noise[iv, :, :] = convolve_fft(noise[iv, :, :], beam)
         if Delta_v is not None:
-            noise =  model._spectral_convolve(noise, Delta_v)
-        #print(np.std(noise), beam_area/pix_area)
+            noise = model._spectral_convolve(noise, Delta_v)
+        # print(np.std(noise), beam_area/pix_area)
         noise *= rms / np.std(noise)
         image += noise
+
+    # bin channels as requested
+    if binned_dv is not None:
+
+        print(f"Binning in velocity to spacing of {binned_dv:.2f} km/s")
+
+        # get bin edges without assuming that its a multiple of the current spacing
+        bin_edge_zero = binned_dv / 2
+        bin_edge_max = model.velocity.max() + binned_dv / 2
+        positive_bin_edges = np.arange(
+            bin_edge_zero, bin_edge_max + binned_dv, binned_dv
+        )
+        negative_bin_edges = -positive_bin_edges[::-1]
+        all_bin_edges = np.concatenate((negative_bin_edges, positive_bin_edges))
+
+        # do binning
+        binned_image = np.zeros(
+            (len(all_bin_edges) - 1, image.shape[1], image.shape[2])
+        )
+        for i in tqdm(range(image.shape[1])):
+            for j in range(image.shape[2]):
+                # get line
+                line = image[:, i, j]
+                # get binned line
+                binned_line, _, _ = binned_statistic(
+                    x=model.velocity, values=line, bins=all_bin_edges
+                )
+                # store
+                binned_image[:, i, j] = binned_line
+
+        # overwrite image with binned image
+        image = binned_image
+
+        # update header
+        hdr["CTYPE3"] = "VELO-LSR"
+        hdr["CRVAL3"] = 0.0  # line center
+        hdr["CRPIX3"] = image.shape[0] // 2 + 1
+        hdr["CDELT3"] = binned_dv * 1e3
+        hdr["CUNIT3"] = "m/s"
 
     hdu = fits.PrimaryHDU(image, header=hdr)
     hdul = fits.HDUList(hdu)
 
     hdul.writeto(workdir + simu_name + ".fits", overwrite=True)
 
-#	if rms > 0.0:
-#		noise = np.random.randn(cube.size).reshape(cube.shape)
-#		noise = np.array([convolve(c, beam) for c in noise])
-#		noise = np.convolve(noise, spectral_response, axis=0)
-#		noise *= rms / np.std(noise)
-#		image += noise
+
+# 	if rms > 0.0:
+# 		noise = np.random.randn(cube.size).reshape(cube.shape)
+# 		noise = np.array([convolve(c, beam) for c in noise])
+# 		noise = np.convolve(noise, spectral_response, axis=0)
+# 		noise *= rms / np.std(noise)
+# 		image += noise
+
 
 def CASA_simdata(
     model,
@@ -172,7 +240,7 @@ def CASA_simdata(
     iTrans=None,
     rt=True,
     only_prepare=False,
-    interferometer='alma',
+    interferometer="alma",
     mosaic=False,
     mapsize=None,
     channels=None,
@@ -181,7 +249,8 @@ def CASA_simdata(
     simu_name=None,
     ms=None,
     n_iter=10000,
-    hourangle="transit"):
+    hourangle="transit",
+):
     """
     Prepare a MCFOST model for the CASA alma simulator
 
@@ -208,7 +277,9 @@ def CASA_simdata(
 
         nTrans = model.freq.size
         if iTrans > nTrans - 1:
-            raise Exception(f"ERROR: iTrans is not in the computed range : nTrans={nTrans}")
+            raise Exception(
+                f"ERROR: iTrans is not in the computed range : nTrans={nTrans}"
+            )
 
     if ms is None:
         # --- Setting a configuration and observing time for simalma
@@ -231,7 +302,7 @@ def CASA_simdata(
                 config = f"alma.cycle6.{config}"
                 resol_name = "_config=" + config
                 resol_name_script = config
-            else: # we do not change config
+            else:  # we do not change config
                 resol_name_script = config
 
     else:
@@ -278,7 +349,9 @@ def CASA_simdata(
         if model.is_casa:
             image = model.image[:, :]
         else:
-            image = Wm2_to_Jy(model.image[0, iaz, i, :, :], sc.c / model.wl)  # Convert to Jy
+            image = Wm2_to_Jy(
+                model.image[0, iaz, i, :, :], sc.c / model.wl
+            )  # Convert to Jy
             image = image[
                 np.newaxis, np.newaxis, :, :
             ]  # Adding spectral & pola dimensions
@@ -286,8 +359,12 @@ def CASA_simdata(
         if model.is_casa:
             image = model.lines[channels, :, :]
         else:
-            image = Wm2_to_Jy(model.lines[iaz, i, iTrans, channels, :, :], model.freq[iTrans])  # Convert to Jy
-    if (image.ndim == 2):  # Adding extra spectral dimension if there is only 1 channel selected
+            image = Wm2_to_Jy(
+                model.lines[iaz, i, iTrans, channels, :, :], model.freq[iTrans]
+            )  # Convert to Jy
+    if (
+        image.ndim == 2
+    ):  # Adding extra spectral dimension if there is only 1 channel selected
         image = image[np.newaxis, :, :]
 
     # -- pixels
@@ -375,7 +452,7 @@ integration = '{sampling_time}s'
 """
 
         # Configuration
-        txt += f"repodir=os.getenv(\"CASAPATH\").split(\' \')[0]\n"
+        txt += f"repodir=os.getenv(\"CASAPATH\").split(' ')[0]\n"
         if resol is None:
             if isinstance(config, str):
                 txt += f"antennalist = repodir+'/data/alma/simmos/" + config + ".cfg'\n"
@@ -387,7 +464,7 @@ integration = '{sampling_time}s'
                     txt += "repodir+'/data/alma/simmos/" + c + ".cfg'"
                 txt += "]\n"
         else:
-            txt += f"antennalist = \"alma;"+ resol_name +"arcsec\"\n"
+            txt += f'antennalist = "alma;' + resol_name + 'arcsec"\n'
 
     # Noise
     txt += f"thermalnoise = " + th_noise + "\n"
@@ -442,7 +519,7 @@ async = False
     txt += "exit\n"
 
     # writing the script to disk
-    outfile = open(workdir + simu_name + ".py", 'w')
+    outfile = open(workdir + simu_name + ".py", "w")
     outfile.write(txt)
     outfile.close()
 
